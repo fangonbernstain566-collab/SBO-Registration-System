@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
-import { supabase } from '../lib/supabase'
+import { supabase } from '../../lib/supabase'
 
 const ADMIN_PIN = '1234'
 
