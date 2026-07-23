@@ -2,7 +2,6 @@
 
 import { Suspense, useState, useEffect } from 'react'
 import { useSearchParams } from 'next/navigation'
-import { supabase } from '../../lib/supabase'
 
 function ScanContent() {
   const searchParams = useSearchParams()
@@ -15,37 +14,13 @@ function ScanContent() {
   useEffect(() => {
     async function validateToken() {
       const eventId     = searchParams.get('event')
-      const tokenBucket = parseInt(searchParams.get('t'))
+      const tokenBucket = searchParams.get('t')
 
-      if (!eventId || isNaN(tokenBucket)) {
-        setErrorMsg('Invalid QR code. Please scan the QR shown at the event.')
-        setStatus('error')
-        return
-      }
+      const res = await fetch(`/api/scan/validate?event=${encodeURIComponent(eventId || '')}&t=${encodeURIComponent(tokenBucket || '')}`)
+      const data = await res.json()
 
-      const currentBucket = Math.floor(Date.now() / 30000)
-      const isTokenFresh  = tokenBucket === currentBucket || tokenBucket === currentBucket - 1
-
-      if (!isTokenFresh) {
-        setErrorMsg('This QR code has expired. Scan the latest code shown at the event.')
-        setStatus('error')
-        return
-      }
-
-      const { data, error } = await supabase
-        .from('events')
-        .select('id, name, qr_window_active, qr_window_closes_at')
-        .eq('id', eventId)
-        .single()
-
-      if (error || !data) {
-        setErrorMsg('Event not found.')
-        setStatus('error')
-        return
-      }
-
-      if (!data.qr_window_active) {
-        setErrorMsg('The attendance window for this event is no longer open.')
+      if (!data.valid) {
+        setErrorMsg(data.message)
         setStatus('error')
         return
       }
@@ -60,45 +35,24 @@ function ScanContent() {
     e.preventDefault()
     setSubmitting(true)
 
-    const eventId   = searchParams.get('event')
-    const trimmedId = studentId.trim()
+    const eventId     = searchParams.get('event')
+    const tokenBucket = parseInt(searchParams.get('t'))
 
-    const { data: registration, error: lookupError } = await supabase
-      .from('registrations')
-      .select('id, full_name, has_attended')
-      .eq('event_id', eventId)
-      .eq('student_id', trimmedId)
-      .single()
+    const res = await fetch('/api/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ eventId, tokenBucket, studentId }),
+    })
+    const data = await res.json()
 
-    if (lookupError || !registration) {
-      setStatus('not-found')
-      setSubmitting(false)
-      return
+    if (data.status === 'error') {
+      setErrorMsg(data.message)
     }
-
-    if (registration.has_attended) {
-      setStudentName(registration.full_name)
-      setStatus('already')
-      setSubmitting(false)
-      return
+    if (data.studentName) {
+      setStudentName(data.studentName)
     }
-
-    const { error: updateError } = await supabase
-      .from('registrations')
-      .update({
-        has_attended: true,
-        attended_at:  new Date().toISOString(),
-      })
-      .eq('id', registration.id)
-
-    if (updateError) {
-      setErrorMsg('Something went wrong. Please try again.')
-      setSubmitting(false)
-      return
-    }
-
-    setStudentName(registration.full_name)
-    setStatus('success')
+    setStatus(data.status)
+    setSubmitting(false)
   }
 
   if (status === 'validating') {

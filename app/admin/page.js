@@ -4,14 +4,14 @@ import { useState, useEffect } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import { supabase } from '../../lib/supabase'
 
-const ADMIN_PIN = '1234'
-
 export default function AdminPage() {
 
   // ── STATE ─────────────────────────────────────────────────
-  const [unlocked, setUnlocked]         = useState(false)  // PIN gate passed?
-  const [pinInput, setPinInput]         = useState('')      // What admin typed
-  const [pinError, setPinError]         = useState(false)   // Wrong PIN?
+  const [session, setSession]           = useState(undefined) // undefined = still checking, null = signed out
+  const [emailInput, setEmailInput]     = useState('')
+  const [passwordInput, setPasswordInput] = useState('')
+  const [authError, setAuthError]       = useState('')
+  const [signingIn, setSigningIn]       = useState(false)
 
   const [events, setEvents]             = useState([])     // All events from DB
   const [loading, setLoading]           = useState(true)   // Still fetching?
@@ -22,23 +22,43 @@ export default function AdminPage() {
   const [windowExpiry, setWindowExpiry] = useState(null)  // When 10-min window ends
 
 
-  // ── PIN CHECK ─────────────────────────────────────────────
-  function handlePinSubmit(e) {
+  // ── AUTH: LOAD + SUBSCRIBE TO SESSION ─────────────────────
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session))
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession)
+    })
+
+    return () => listener.subscription.unsubscribe()
+  }, [])
+
+  async function handleLoginSubmit(e) {
     e.preventDefault()
-    if (pinInput === ADMIN_PIN) {
-      setUnlocked(true)
-    } else {
-      setPinError(true)
-      setPinInput('')
+    setAuthError('')
+    setSigningIn(true)
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email: emailInput,
+      password: passwordInput,
+    })
+
+    if (error) {
+      setAuthError('Incorrect email or password.')
+      setPasswordInput('')
     }
+    setSigningIn(false)
+  }
+
+  async function handleSignOut() {
+    await supabase.auth.signOut()
   }
 
 
   // ── FETCH EVENTS ──────────────────────────────────────────
-  // Only fetches once the admin has passed the PIN gate.
-  // The if (!unlocked) return prevents unnecessary DB calls.
+  // Only fetches once the admin is authenticated.
   useEffect(() => {
-    if (!unlocked) return
+    if (!session) return
 
     async function fetchEvents() {
       const { data, error } = await supabase
@@ -51,7 +71,7 @@ export default function AdminPage() {
     }
 
     fetchEvents()
-  }, [unlocked])
+  }, [session])
 
 
   // ── QR ROTATION LOGIC ─────────────────────────────────────
@@ -89,41 +109,48 @@ export default function AdminPage() {
 
 
   // ── ACTIVATE QR WINDOW ────────────────────────────────────
-  // Updates the event row in Supabase to mark it as active,
-  // records when it opened, and sets the 10-minute expiry.
+  // Calls the server route (service-role key) to mark the event active,
+  // record when it opened, and set the 10-minute expiry.
   async function handleActivate(event) {
-    const now = new Date()
-    const closesAt = new Date(now.getTime() + 10 * 60 * 1000) // +10 minutes
+    const { data: { session: current } } = await supabase.auth.getSession()
 
-    const { error } = await supabase
-      .from('events')
-      .update({
-        qr_window_active:    true,
-        qr_window_opened_at: now.toISOString(),
-        qr_window_closes_at: closesAt.toISOString(),
-      })
-      .eq('id', event.id)
+    const res = await fetch('/api/admin/activate', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${current?.access_token}`,
+      },
+      body: JSON.stringify({ eventId: event.id }),
+    })
 
-    if (error) {
-      console.error('Failed to activate QR window:', error.message)
+    if (!res.ok) {
+      console.error('Failed to activate QR window')
       return
     }
 
+    const { event: updatedEvent } = await res.json()
+
     // Store the active event and expiry in state to drive the QR display
-    setActiveEvent(event)
-    setWindowExpiry(closesAt.getTime())
+    setActiveEvent(updatedEvent)
+    setWindowExpiry(new Date(updatedEvent.qr_window_closes_at).getTime())
   }
 
 
   // ── DEACTIVATE QR WINDOW ──────────────────────────────────
-  // Closes the QR window in the DB and resets local state.
+  // Closes the QR window via the server route and resets local state.
   async function handleDeactivate() {
     if (!activeEvent) return
 
-    await supabase
-      .from('events')
-      .update({ qr_window_active: false })
-      .eq('id', activeEvent.id)
+    const { data: { session: current } } = await supabase.auth.getSession()
+
+    await fetch('/api/admin/deactivate', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${current?.access_token}`,
+      },
+      body: JSON.stringify({ eventId: activeEvent.id }),
+    })
 
     setActiveEvent(null)
     setScanUrl('')
@@ -131,33 +158,56 @@ export default function AdminPage() {
   }
 
 
-  // ── RENDER: PIN GATE ──────────────────────────────────────
-  // Shown before the admin has authenticated.
-  if (!unlocked) {
+  // ── RENDER: AUTH LOADING ───────────────────────────────────
+  // session is undefined until the initial getSession() resolves.
+  if (session === undefined) {
+    return (
+      <main className="min-h-screen bg-gray-950 flex items-center justify-center px-4">
+        <p className="text-gray-500 text-sm">Loading...</p>
+      </main>
+    )
+  }
+
+
+  // ── RENDER: LOGIN GATE ─────────────────────────────────────
+  // Shown before the admin has authenticated with Supabase Auth.
+  if (!session) {
     return (
       <main className="min-h-screen bg-gray-950 flex items-center justify-center px-4">
         <div className="bg-gray-900 border border-gray-800 rounded-2xl p-8 w-full max-w-sm text-center">
           <p className="text-xs font-semibold tracking-widest text-indigo-400 uppercase mb-2">
             Admin Access
           </p>
-          <h1 className="text-2xl font-bold text-white mb-6">Enter PIN</h1>
+          <h1 className="text-2xl font-bold text-white mb-6">Sign In</h1>
 
-          <form onSubmit={handlePinSubmit} className="space-y-4">
+          <form onSubmit={handleLoginSubmit} className="space-y-4">
+            <input
+              type="email"
+              value={emailInput}
+              onChange={(e) => { setEmailInput(e.target.value); setAuthError('') }}
+              placeholder="admin@example.com"
+              autoComplete="username"
+              required
+              className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
             <input
               type="password"
-              value={pinInput}
-              onChange={(e) => { setPinInput(e.target.value); setPinError(false) }}
-              placeholder="••••"
-              className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg px-4 py-3 text-center text-lg tracking-widest focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              value={passwordInput}
+              onChange={(e) => { setPasswordInput(e.target.value); setAuthError('') }}
+              placeholder="Password"
+              autoComplete="current-password"
+              required
+              className="w-full bg-gray-800 border border-gray-700 text-white rounded-lg px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
             />
-            {pinError && (
-              <p className="text-red-400 text-sm">Incorrect PIN. Try again.</p>
+            {authError && (
+              <p className="text-red-400 text-sm">{authError}</p>
             )}
             <button
               type="submit"
-              className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-lg transition-colors"
+              disabled={signingIn}
+              className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white font-semibold py-3 rounded-lg transition-colors"
             >
-              Unlock
+              {signingIn ? 'Signing in...' : 'Sign In'}
             </button>
           </form>
         </div>
@@ -218,14 +268,22 @@ export default function AdminPage() {
     <main className="min-h-screen bg-gray-950 px-4 py-12">
       <div className="max-w-xl mx-auto">
 
-        <div className="mb-8">
-          <p className="text-xs font-semibold tracking-widest text-indigo-400 uppercase mb-2">
-            Admin Panel
-          </p>
-          <h1 className="text-3xl font-bold text-white">Events</h1>
-          <p className="text-gray-500 text-sm mt-1">
-            Open a QR window at the end of an event so students can scan their attendance.
-          </p>
+        <div className="mb-8 flex items-start justify-between gap-4">
+          <div>
+            <p className="text-xs font-semibold tracking-widest text-indigo-400 uppercase mb-2">
+              Admin Panel
+            </p>
+            <h1 className="text-3xl font-bold text-white">Events</h1>
+            <p className="text-gray-500 text-sm mt-1">
+              Open a QR window at the end of an event so students can scan their attendance.
+            </p>
+          </div>
+          <button
+            onClick={handleSignOut}
+            className="text-gray-500 hover:text-white text-xs font-semibold px-3 py-2 rounded-lg border border-gray-800 hover:border-gray-700 transition-colors whitespace-nowrap"
+          >
+            Sign Out
+          </button>
         </div>
 
         {loading ? (
